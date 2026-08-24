@@ -5,8 +5,11 @@ import {Test} from "forge-std/Test.sol";
 import {ForwarderFactory} from "../src/ForwarderFactory.sol";
 import {Forwarder} from "../src/Forwarder.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
+import {ReentrantFeeRecipient} from "./mocks/ReentrantFeeRecipient.sol";
 
 contract ForwarderFactoryTest is Test {
+    uint256 constant MAX_SWEEP_FEE = 0.001 ether;
+
     address founderWallet = makeAddr("founderWallet");
     address payer = makeAddr("payer");
     address relayer = makeAddr("relayer");
@@ -15,7 +18,7 @@ contract ForwarderFactoryTest is Test {
     MockERC20 token;
 
     function setUp() public {
-        factory = new ForwarderFactory(founderWallet);
+        factory = new ForwarderFactory(founderWallet, MAX_SWEEP_FEE);
         token = new MockERC20();
     }
 
@@ -28,6 +31,13 @@ contract ForwarderFactoryTest is Test {
         tokens[0] = t;
     }
 
+    function _payNative(address depositAddress, uint256 amount) internal {
+        vm.deal(payer, payer.balance + amount);
+        vm.prank(payer);
+        (bool ok,) = depositAddress.call{value: amount}("");
+        assertTrue(ok);
+    }
+
     function test_ComputeAddressMatchesDeployedCloneAddress() public {
         bytes32 salt = keccak256("invoice-1");
         address predicted = factory.computeAddress(salt);
@@ -35,7 +45,7 @@ contract ForwarderFactoryTest is Test {
         assertEq(predicted.code.length, 0, "should be undeployed before first sweep");
 
         vm.prank(relayer);
-        address clone = factory.deployAndSweep(salt, _emptyTokens());
+        address clone = factory.deployAndSweep(salt, _emptyTokens(), 0);
 
         assertEq(clone, predicted);
         assertGt(clone.code.length, 0);
@@ -50,15 +60,10 @@ contract ForwarderFactoryTest is Test {
     function test_DeployAndSweepForwardsNativeBalance() public {
         bytes32 salt = keccak256("invoice-native");
         address depositAddress = factory.computeAddress(salt);
-
-        vm.deal(payer, 1 ether);
-        vm.prank(payer);
-        (bool ok,) = depositAddress.call{value: 1 ether}("");
-        assertTrue(ok);
-        assertEq(depositAddress.balance, 1 ether);
+        _payNative(depositAddress, 1 ether);
 
         vm.prank(relayer);
-        factory.deployAndSweep(salt, _emptyTokens());
+        factory.deployAndSweep(salt, _emptyTokens(), 0);
 
         assertEq(depositAddress.balance, 0);
         assertEq(founderWallet.balance, 1 ether);
@@ -72,7 +77,7 @@ contract ForwarderFactoryTest is Test {
         assertEq(token.balanceOf(depositAddress), 500 ether);
 
         vm.prank(relayer);
-        factory.deployAndSweep(salt, _singleToken(address(token)));
+        factory.deployAndSweep(salt, _singleToken(address(token)), 0);
 
         assertEq(token.balanceOf(depositAddress), 0);
         assertEq(token.balanceOf(founderWallet), 500 ether);
@@ -83,16 +88,13 @@ contract ForwarderFactoryTest is Test {
         address depositAddress = factory.computeAddress(salt);
         assertEq(depositAddress.code.length, 0);
 
-        vm.deal(payer, 2 ether);
-        vm.prank(payer);
-        (bool ok,) = depositAddress.call{value: 2 ether}("");
-        assertTrue(ok);
+        _payNative(depositAddress, 2 ether);
         token.mint(depositAddress, 100 ether);
 
         assertEq(depositAddress.code.length, 0, "still undeployed after receiving funds");
 
         vm.prank(relayer);
-        factory.deployAndSweep(salt, _singleToken(address(token)));
+        factory.deployAndSweep(salt, _singleToken(address(token)), 0);
 
         assertGt(depositAddress.code.length, 0, "deployed as part of the sweep");
         assertEq(founderWallet.balance, 2 ether);
@@ -103,21 +105,14 @@ contract ForwarderFactoryTest is Test {
         bytes32 salt = keccak256("invoice-topup");
         address depositAddress = factory.computeAddress(salt);
 
-        vm.deal(payer, 3 ether);
-        vm.prank(payer);
-        (bool ok1,) = depositAddress.call{value: 1 ether}("");
-        assertTrue(ok1);
-
+        _payNative(depositAddress, 1 ether);
         vm.prank(relayer);
-        factory.deployAndSweep(salt, _emptyTokens());
+        factory.deployAndSweep(salt, _emptyTokens(), 0);
         assertEq(founderWallet.balance, 1 ether);
 
-        vm.prank(payer);
-        (bool ok2,) = depositAddress.call{value: 2 ether}("");
-        assertTrue(ok2);
-
+        _payNative(depositAddress, 2 ether);
         vm.prank(relayer);
-        factory.deployAndSweep(salt, _emptyTokens());
+        factory.deployAndSweep(salt, _emptyTokens(), 0);
         assertEq(founderWallet.balance, 3 ether);
     }
 
@@ -125,7 +120,7 @@ contract ForwarderFactoryTest is Test {
         bytes32 salt = keccak256("invoice-empty");
 
         vm.prank(relayer);
-        factory.deployAndSweep(salt, _emptyTokens());
+        factory.deployAndSweep(salt, _emptyTokens(), 0);
 
         assertEq(founderWallet.balance, 0);
     }
@@ -134,21 +129,17 @@ contract ForwarderFactoryTest is Test {
         vm.assume(caller != address(0));
         bytes32 salt = keccak256("invoice-permissionless");
         address depositAddress = factory.computeAddress(salt);
-
-        vm.deal(payer, 1 ether);
-        vm.prank(payer);
-        (bool ok,) = depositAddress.call{value: 1 ether}("");
-        assertTrue(ok);
+        _payNative(depositAddress, 1 ether);
 
         vm.prank(caller);
-        factory.deployAndSweep(salt, _emptyTokens());
+        factory.deployAndSweep(salt, _emptyTokens(), 0);
 
         assertEq(founderWallet.balance, 1 ether);
     }
 
     function test_AllClonesShareTheSameImmutableFounderWallet() public {
-        address cloneA = factory.deployAndSweep(keccak256("invoice-a"), _emptyTokens());
-        address cloneB = factory.deployAndSweep(keccak256("invoice-b"), _emptyTokens());
+        address cloneA = factory.deployAndSweep(keccak256("invoice-a"), _emptyTokens(), 0);
+        address cloneB = factory.deployAndSweep(keccak256("invoice-b"), _emptyTokens(), 0);
 
         assertEq(Forwarder(payable(cloneA)).FOUNDER_WALLET(), founderWallet);
         assertEq(Forwarder(payable(cloneB)).FOUNDER_WALLET(), founderWallet);
@@ -156,6 +147,135 @@ contract ForwarderFactoryTest is Test {
 
     function test_ConstructorRevertsOnZeroFounderWallet() public {
         vm.expectRevert("Forwarder: zero founder wallet");
-        new ForwarderFactory(address(0));
+        new ForwarderFactory(address(0), MAX_SWEEP_FEE);
+    }
+
+    // -- Sweep fee ------------------------------------------------------
+
+    function test_SweepFeePaysCallerAndReducesFounderAmount() public {
+        bytes32 salt = keccak256("invoice-fee");
+        address depositAddress = factory.computeAddress(salt);
+        _payNative(depositAddress, 1 ether);
+
+        uint256 fee = 0.0005 ether;
+        vm.prank(relayer);
+        factory.deployAndSweep(salt, _emptyTokens(), fee);
+
+        assertEq(relayer.balance, fee);
+        assertEq(founderWallet.balance, 1 ether - fee);
+    }
+
+    function test_SweepFeeAtExactlyMaxSucceeds() public {
+        bytes32 salt = keccak256("invoice-fee-max");
+        address depositAddress = factory.computeAddress(salt);
+        _payNative(depositAddress, 1 ether);
+
+        vm.prank(relayer);
+        factory.deployAndSweep(salt, _emptyTokens(), MAX_SWEEP_FEE);
+
+        assertEq(relayer.balance, MAX_SWEEP_FEE);
+        assertEq(founderWallet.balance, 1 ether - MAX_SWEEP_FEE);
+    }
+
+    function test_SweepFeeAboveMaxReverts() public {
+        bytes32 salt = keccak256("invoice-fee-too-high");
+        address depositAddress = factory.computeAddress(salt);
+        _payNative(depositAddress, 1 ether);
+
+        vm.prank(relayer);
+        vm.expectRevert("Forwarder: fee exceeds max");
+        factory.deployAndSweep(salt, _emptyTokens(), MAX_SWEEP_FEE + 1);
+    }
+
+    function test_SweepFeeAboveNativeBalanceReverts() public {
+        bytes32 salt = keccak256("invoice-fee-underfunded");
+        address depositAddress = factory.computeAddress(salt);
+        _payNative(depositAddress, 0.0001 ether);
+
+        vm.prank(relayer);
+        vm.expectRevert("Forwarder: insufficient balance for fee");
+        factory.deployAndSweep(salt, _emptyTokens(), 0.0005 ether);
+    }
+
+    function test_TokenOnlyDepositSweepsWithZeroFee() public {
+        bytes32 salt = keccak256("invoice-token-only");
+        address depositAddress = factory.computeAddress(salt);
+        token.mint(depositAddress, 50 ether);
+
+        vm.prank(relayer);
+        factory.deployAndSweep(salt, _singleToken(address(token)), 0);
+
+        assertEq(token.balanceOf(founderWallet), 50 ether);
+        assertEq(relayer.balance, 0);
+    }
+
+    function test_TokenOnlyDepositRevertsIfFeeRequestedAnyway() public {
+        bytes32 salt = keccak256("invoice-token-only-fee");
+        address depositAddress = factory.computeAddress(salt);
+        token.mint(depositAddress, 50 ether);
+
+        vm.prank(relayer);
+        vm.expectRevert("Forwarder: insufficient balance for fee");
+        factory.deployAndSweep(salt, _singleToken(address(token)), 0.0001 ether);
+    }
+
+    // -- Batch sweep ------------------------------------------------------
+
+    function test_BatchDeployAndSweepSweepsMultipleInvoicesInOneCall() public {
+        bytes32[] memory salts = new bytes32[](2);
+        salts[0] = keccak256("invoice-batch-a");
+        salts[1] = keccak256("invoice-batch-b");
+
+        address depositA = factory.computeAddress(salts[0]);
+        address depositB = factory.computeAddress(salts[1]);
+        _payNative(depositA, 1 ether);
+        _payNative(depositB, 2 ether);
+
+        address[][] memory tokensPerSalt = new address[][](2);
+        tokensPerSalt[0] = _emptyTokens();
+        tokensPerSalt[1] = _emptyTokens();
+
+        uint256[] memory fees = new uint256[](2);
+        fees[0] = 0.0001 ether;
+        fees[1] = 0.0002 ether;
+
+        vm.prank(relayer);
+        address[] memory clones = factory.batchDeployAndSweep(salts, tokensPerSalt, fees);
+
+        assertEq(clones.length, 2);
+        assertEq(relayer.balance, fees[0] + fees[1]);
+        assertEq(founderWallet.balance, (1 ether - fees[0]) + (2 ether - fees[1]));
+    }
+
+    function test_BatchDeployAndSweepRevertsOnLengthMismatch() public {
+        bytes32[] memory salts = new bytes32[](2);
+        address[][] memory tokensPerSalt = new address[][](1);
+        uint256[] memory fees = new uint256[](2);
+
+        vm.expectRevert("ForwarderFactory: length mismatch");
+        factory.batchDeployAndSweep(salts, tokensPerSalt, fees);
+    }
+
+    // -- Reentrancy ------------------------------------------------------
+
+    function test_ReentrantFeeRecipientCannotExtractExtraFunds() public {
+        bytes32 salt = keccak256("invoice-reentrancy");
+        address depositAddress = factory.computeAddress(salt);
+        _payNative(depositAddress, 1 ether);
+
+        ReentrantFeeRecipient attacker = new ReentrantFeeRecipient();
+
+        vm.prank(relayer);
+        address clone = factory.deployAndSweep(salt, _emptyTokens(), 0);
+        attacker.setTarget(Forwarder(payable(clone)), MAX_SWEEP_FEE);
+
+        _payNative(depositAddress, 1 ether);
+
+        vm.expectRevert();
+        Forwarder(payable(clone)).sweep(_emptyTokens(), MAX_SWEEP_FEE, address(attacker));
+
+        // The whole call reverted: no funds moved anywhere.
+        assertEq(depositAddress.balance, 1 ether);
+        assertEq(address(attacker).balance, 0);
     }
 }

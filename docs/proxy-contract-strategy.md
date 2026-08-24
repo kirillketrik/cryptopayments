@@ -55,16 +55,19 @@ standard "counterfactual deposit address" pattern (Argent, early Tornado Cash re
 many exchange deposit-address systems use variants of it).
 
 - A `ForwarderFactory` contract is deployed once per chain. It exposes
-  `computeAddress(salt) -> address` (pure, no state change) and
-  `deployAndSweep(salt)` (deploys the clone via `CREATE2` if not already deployed, then
-  calls its `sweep()`).
-- The clone's implementation contract is a minimal forwarder: on `sweep()`, it transfers
-  its entire native-token balance, and the balance of any ERC-20 addresses passed in, to
-  an **immutable** `FOUNDER_WALLET` address baked into the factory's init code (so every
-  clone, once its address is derived from `keccak256(factory ++ salt ++ initCodeHash)`,
-  has that same destination compiled in — changing the founder wallet means deploying a
-  new factory version, which naturally produces new deposit addresses, never silently
-  redirects existing ones).
+  `computeAddress(salt) -> address` (pure, no state change), `deployAndSweep(salt, tokens,
+  feeAmount)` (deploys the clone via `CREATE2` if not already deployed, then calls its
+  `sweep()`), and `batchDeployAndSweep(salts, tokensPerSalt, feeAmounts)` (the same for
+  many invoices in one transaction, amortizing the base tx cost across all of them).
+- The clone's implementation contract is a minimal forwarder: on `sweep()`, it pays the
+  caller `feeAmount` in native currency (capped by an immutable `MAX_SWEEP_FEE`, and by
+  whatever native balance the clone actually holds) to cover the blockchain fee they paid
+  to call it, then transfers the rest of its native-token balance, and the balance of any
+  ERC-20 addresses passed in, to an **immutable** `FOUNDER_WALLET` address baked into the
+  factory's init code (so every clone, once its address is derived from
+  `keccak256(factory ++ salt ++ initCodeHash)`, has that same destination compiled in —
+  changing the founder wallet means deploying a new factory version, which naturally
+  produces new deposit addresses, never silently redirects existing ones).
 - `salt` is derived from the invoice id (e.g. `keccak256(invoiceId)`), giving a stable,
   deterministic 1:1 mapping between invoice and address without needing to store the
   mapping on-chain.
@@ -72,11 +75,16 @@ many exchange deposit-address systems use variants of it).
   discover "which tokens might have been sent" on its own) — `SweepStrategy.sweep()` is
   responsible for passing the relevant token addresses in, based on what
   `ChainClient.list_incoming_transactions()` observed.
-- Gas for the `deployAndSweep` call is paid by the operator's relayer wallet, not by the
-  clone (which may hold no native token at all if it only received an ERC-20). This is
-  the one place the design needs an operational (not contract-level) safeguard: the
-  relayer key can grief availability (delay sweeps) but — because the forwarder logic is
-  immutable and permissionless — can never redirect funds, even if compromised.
+- **The blockchain fee for calling `deployAndSweep` is paid out of the swept funds, not by
+  the operator.** The relayer supplies the actual `feeAmount` it wants reimbursed per
+  call (tracking real gas cost at call time), but that amount is hard-capped by the
+  immutable `MAX_SWEEP_FEE` set when the factory is deployed — so a compromised or
+  misbehaving relayer can claim at most that fixed ceiling per sweep, never redirect the
+  bulk of the funds. A clone with no native balance (an ERC-20-only deposit) simply can't
+  be charged a fee — the relayer requests `feeAmount = 0` for those. The relayer key can
+  still grief availability (delay sweeps, or decline to sweep fee-less token-only
+  deposits) but — because the forwarder logic is immutable and permissionless — can never
+  redirect funds, even if compromised.
 
 **Open question for implementation phase:** whether to self-destruct the clone after
 sweep to reclaim gas refund. Post-Dencun (EIP-6780), `SELFDESTRUCT` only refunds/deletes

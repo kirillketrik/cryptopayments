@@ -19,12 +19,14 @@ import {Forwarder} from "./Forwarder.sol";
 contract ForwarderFactory {
     address public immutable implementation;
     address public immutable founderWallet;
+    uint256 public immutable maxSweepFee;
 
     event Deployed(address indexed clone, bytes32 indexed salt);
 
-    constructor(address founderWallet_) {
+    constructor(address founderWallet_, uint256 maxSweepFee_) {
         founderWallet = founderWallet_;
-        implementation = address(new Forwarder(founderWallet_));
+        maxSweepFee = maxSweepFee_;
+        implementation = address(new Forwarder(founderWallet_, maxSweepFee_));
     }
 
     /// @notice The deposit address for `salt`, computable off-chain before
@@ -35,12 +37,45 @@ contract ForwarderFactory {
         return Clones.predictDeterministicAddress(implementation, salt, address(this));
     }
 
-    /// @notice Deploy the clone for `salt` if it isn't already deployed, then
-    /// sweep its current native + `tokens` balances to {founderWallet}.
-    /// Permissionless and idempotent: safe to call again on an
-    /// already-deployed clone (it just sweeps again), and safe to call
-    /// before the clone has ever received anything (sweep is then a no-op).
-    function deployAndSweep(bytes32 salt, address[] calldata tokens) external returns (address clone) {
+    /// @notice Deploy the clone for `salt` if it isn't already deployed,
+    /// then sweep its current native + `tokens` balances to
+    /// {founderWallet}, paying the caller `feeAmount` (native currency,
+    /// capped by {Forwarder-MAX_SWEEP_FEE}) out of the swept funds to cover
+    /// the blockchain fee they paid for this call. Permissionless and
+    /// idempotent: safe to call again on an already-deployed clone (it just
+    /// sweeps again, with feeAmount = 0 for a no-op re-check), and safe to
+    /// call before the clone has ever received anything.
+    function deployAndSweep(bytes32 salt, address[] calldata tokens, uint256 feeAmount)
+        external
+        returns (address clone)
+    {
+        return _deployAndSweep(salt, tokens, feeAmount, msg.sender);
+    }
+
+    /// @notice Batched form of {deployAndSweep}: sweeps many invoices in one
+    /// transaction, amortizing the base transaction cost across all of them.
+    /// `salts`, `tokensPerSalt`, and `feeAmounts` must be the same length,
+    /// index-aligned per invoice. All fee payments go to the caller.
+    function batchDeployAndSweep(
+        bytes32[] calldata salts,
+        address[][] calldata tokensPerSalt,
+        uint256[] calldata feeAmounts
+    ) external returns (address[] memory clones) {
+        require(
+            salts.length == tokensPerSalt.length && salts.length == feeAmounts.length,
+            "ForwarderFactory: length mismatch"
+        );
+
+        clones = new address[](salts.length);
+        for (uint256 i = 0; i < salts.length; i++) {
+            clones[i] = _deployAndSweep(salts[i], tokensPerSalt[i], feeAmounts[i], msg.sender);
+        }
+    }
+
+    function _deployAndSweep(bytes32 salt, address[] calldata tokens, uint256 feeAmount, address feeRecipient)
+        internal
+        returns (address clone)
+    {
         address predicted = computeAddress(salt);
         if (predicted.code.length == 0) {
             clone = Clones.cloneDeterministic(implementation, salt);
@@ -49,6 +84,6 @@ contract ForwarderFactory {
             clone = predicted;
         }
 
-        Forwarder(payable(clone)).sweep(tokens);
+        Forwarder(payable(clone)).sweep(tokens, feeAmount, feeRecipient);
     }
 }
