@@ -11,10 +11,12 @@ implementation the others are meant to follow.
   EIP-1167 minimal-proxy clone of this contract. `FOUNDER_WALLET` is immutable, baked in
   at implementation-deploy time, and shared by every clone via `delegatecall` — no clone
   has its own settable destination. `sweep(tokens, feeAmount, feeRecipient)` pays
-  `feeRecipient` up to `feeAmount` in native currency (capped by the immutable
-  `MAX_SWEEP_FEE`) to cover the blockchain fee they paid to call it, then forwards the
-  rest of the native balance plus the balance of each address in `tokens` to
-  `FOUNDER_WALLET`. Callable by anyone, and guarded against reentrancy.
+  `feeRecipient` in native currency to cover the blockchain fee they paid to call it, then
+  forwards the rest of the native balance plus the balance of each address in `tokens` to
+  `FOUNDER_WALLET`. The actual amount paid is `min(feeAmount, MAX_SWEEP_FEE, current
+  native balance)` — clamped, never reverted, so a stale fee request or two callers
+  racing to sweep the same clone never blocks the forward-to-founder itself. Callable by
+  anyone, and guarded against reentrancy.
 - `src/ForwarderFactory.sol` — deploys the `Forwarder` implementation once (constructor
   args: the founder wallet address and the immutable `maxSweepFee` cap) and from then on
   exposes `computeAddress(salt)` (pure off-chain-computable CREATE2 address prediction —

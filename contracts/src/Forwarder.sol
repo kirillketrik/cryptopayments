@@ -40,27 +40,34 @@ contract Forwarder is ReentrancyGuard {
         MAX_SWEEP_FEE = maxSweepFee;
     }
 
-    /// @notice Forward this contract's entire native balance, minus
-    /// `feeAmount`, plus the entire balance of each address in `tokens`, to
-    /// {FOUNDER_WALLET}. `feeAmount` (native currency only, capped by
-    /// {MAX_SWEEP_FEE} and by the contract's actual native balance) is paid
-    /// to `feeRecipient` — the blockchain fee for this call is meant to be
-    /// covered out of the funds being swept, not by the caller eating it.
+    /// @notice Forward this contract's entire native balance, minus the
+    /// actual fee paid, plus the entire balance of each address in
+    /// `tokens`, to {FOUNDER_WALLET}. The caller requests `feeAmount`
+    /// (native currency only) to cover the blockchain fee they paid to call
+    /// this — the actual amount paid to `feeRecipient` is silently clamped
+    /// down to `min(feeAmount, MAX_SWEEP_FEE, current native balance)`
+    /// rather than reverting the whole sweep, so a stale or over-optimistic
+    /// fee request (or a race between two callers sweeping the same clone)
+    /// never blocks the forward-to-founder itself — worst case the caller
+    /// is paid less than they asked for. The actual amount paid is always
+    /// visible in the `Swept` event regardless of what was requested.
     /// Safe to call repeatedly and by anyone — each call only ever moves
     /// whatever balance is currently held, so a duplicate or late call is a
-    /// harmless no-op (feeAmount = 0) rather than a double-spend.
+    /// harmless no-op rather than a double-spend.
     function sweep(address[] calldata tokens, uint256 feeAmount, address feeRecipient) external nonReentrant {
         uint256 nativeBalance = address(this).balance;
-        require(feeAmount <= MAX_SWEEP_FEE, "Forwarder: fee exceeds max");
-        require(feeAmount <= nativeBalance, "Forwarder: insufficient balance for fee");
-        require(feeAmount == 0 || feeRecipient != address(0), "Forwarder: zero fee recipient");
 
-        if (feeAmount > 0) {
-            (bool feeOk,) = feeRecipient.call{value: feeAmount}("");
+        uint256 feePaid = feeAmount;
+        if (feePaid > MAX_SWEEP_FEE) feePaid = MAX_SWEEP_FEE;
+        if (feePaid > nativeBalance) feePaid = nativeBalance;
+        require(feePaid == 0 || feeRecipient != address(0), "Forwarder: zero fee recipient");
+
+        if (feePaid > 0) {
+            (bool feeOk,) = feeRecipient.call{value: feePaid}("");
             require(feeOk, "Forwarder: fee transfer failed");
         }
 
-        uint256 nativeToFounder = nativeBalance - feeAmount;
+        uint256 nativeToFounder = nativeBalance - feePaid;
         if (nativeToFounder > 0) {
             (bool ok,) = FOUNDER_WALLET.call{value: nativeToFounder}("");
             require(ok, "Forwarder: native transfer failed");
@@ -76,7 +83,7 @@ contract Forwarder is ReentrancyGuard {
             }
         }
 
-        emit Swept(FOUNDER_WALLET, nativeToFounder, tokens, tokenAmounts, feeRecipient, feeAmount);
+        emit Swept(FOUNDER_WALLET, nativeToFounder, tokens, tokenAmounts, feeRecipient, feePaid);
     }
 
     /// @dev Accepts plain-value transfers with no calldata, e.g. a payer

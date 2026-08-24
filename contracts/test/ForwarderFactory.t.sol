@@ -177,24 +177,28 @@ contract ForwarderFactoryTest is Test {
         assertEq(founderWallet.balance, 1 ether - MAX_SWEEP_FEE);
     }
 
-    function test_SweepFeeAboveMaxReverts() public {
+    function test_SweepFeeAboveMaxIsClampedToMax() public {
         bytes32 salt = keccak256("invoice-fee-too-high");
         address depositAddress = factory.computeAddress(salt);
         _payNative(depositAddress, 1 ether);
 
         vm.prank(relayer);
-        vm.expectRevert("Forwarder: fee exceeds max");
         factory.deployAndSweep(salt, _emptyTokens(), MAX_SWEEP_FEE + 1);
+
+        assertEq(relayer.balance, MAX_SWEEP_FEE, "fee clamped to the immutable cap");
+        assertEq(founderWallet.balance, 1 ether - MAX_SWEEP_FEE);
     }
 
-    function test_SweepFeeAboveNativeBalanceReverts() public {
+    function test_SweepFeeAboveNativeBalanceIsClampedToBalance() public {
         bytes32 salt = keccak256("invoice-fee-underfunded");
         address depositAddress = factory.computeAddress(salt);
         _payNative(depositAddress, 0.0001 ether);
 
         vm.prank(relayer);
-        vm.expectRevert("Forwarder: insufficient balance for fee");
         factory.deployAndSweep(salt, _emptyTokens(), 0.0005 ether);
+
+        assertEq(relayer.balance, 0.0001 ether, "fee clamped to whatever the clone actually held");
+        assertEq(founderWallet.balance, 0);
     }
 
     function test_TokenOnlyDepositSweepsWithZeroFee() public {
@@ -209,14 +213,41 @@ contract ForwarderFactoryTest is Test {
         assertEq(relayer.balance, 0);
     }
 
-    function test_TokenOnlyDepositRevertsIfFeeRequestedAnyway() public {
+    function test_TokenOnlyDepositClampsFeeToZeroInsteadOfReverting() public {
         bytes32 salt = keccak256("invoice-token-only-fee");
         address depositAddress = factory.computeAddress(salt);
         token.mint(depositAddress, 50 ether);
 
         vm.prank(relayer);
-        vm.expectRevert("Forwarder: insufficient balance for fee");
         factory.deployAndSweep(salt, _singleToken(address(token)), 0.0001 ether);
+
+        assertEq(relayer.balance, 0, "no native balance to pay a fee from");
+        assertEq(token.balanceOf(founderWallet), 50 ether, "tokens still forwarded in full");
+    }
+
+    function test_TwoRelayersRacingToSweepTheSameInvoiceBothSucceed() public {
+        bytes32 salt = keccak256("invoice-race");
+        address depositAddress = factory.computeAddress(salt);
+        _payNative(depositAddress, 1 ether);
+
+        address secondRelayer = makeAddr("secondRelayer");
+
+        // Both relayers independently query the balance, see 1 ether, and
+        // each optimistically request the full MAX_SWEEP_FEE. Whichever
+        // transaction lands first gets it in full; the second no longer
+        // reverts (and waste its gas for nothing) just because the balance
+        // it actually sees by the time it lands is smaller — it's clamped
+        // instead, and the sweep still goes through.
+        vm.prank(relayer);
+        factory.deployAndSweep(salt, _emptyTokens(), MAX_SWEEP_FEE);
+        assertEq(relayer.balance, MAX_SWEEP_FEE);
+
+        _payNative(depositAddress, MAX_SWEEP_FEE / 2);
+        vm.prank(secondRelayer);
+        factory.deployAndSweep(salt, _emptyTokens(), MAX_SWEEP_FEE);
+        assertEq(secondRelayer.balance, MAX_SWEEP_FEE / 2, "clamped to what was actually available");
+
+        assertEq(founderWallet.balance, 1 ether - MAX_SWEEP_FEE);
     }
 
     // -- Batch sweep ------------------------------------------------------

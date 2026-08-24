@@ -76,15 +76,16 @@ many exchange deposit-address systems use variants of it).
   responsible for passing the relevant token addresses in, based on what
   `ChainClient.list_incoming_transactions()` observed.
 - **The blockchain fee for calling `deployAndSweep` is paid out of the swept funds, not by
-  the operator.** The relayer supplies the actual `feeAmount` it wants reimbursed per
-  call (tracking real gas cost at call time), but that amount is hard-capped by the
-  immutable `MAX_SWEEP_FEE` set when the factory is deployed — so a compromised or
-  misbehaving relayer can claim at most that fixed ceiling per sweep, never redirect the
-  bulk of the funds. A clone with no native balance (an ERC-20-only deposit) simply can't
-  be charged a fee — the relayer requests `feeAmount = 0` for those. The relayer key can
-  still grief availability (delay sweeps, or decline to sweep fee-less token-only
-  deposits) but — because the forwarder logic is immutable and permissionless — can never
-  redirect funds, even if compromised.
+  the operator.** The relayer supplies the `feeAmount` it wants reimbursed per call
+  (tracking real gas cost at call time), but the amount actually paid is silently clamped
+  to `min(feeAmount, MAX_SWEEP_FEE, current native balance)` rather than reverting the
+  whole sweep on a mismatch — so a compromised or misbehaving relayer can claim at most
+  the fixed `MAX_SWEEP_FEE` ceiling per sweep and never redirect the bulk of the funds,
+  and a stale fee estimate (or two relayers racing to sweep the same clone) still results
+  in the forward-to-founder succeeding rather than the whole call failing. A clone with no
+  native balance (an ERC-20-only deposit) is clamped to a zero fee automatically. The
+  relayer key can still grief availability (delay sweeps) but — because the forwarder
+  logic is immutable and permissionless — can never redirect funds, even if compromised.
 
 **Open question for implementation phase:** whether to self-destruct the clone after
 sweep to reclaim gas refund. Post-Dencun (EIP-6780), `SELFDESTRUCT` only refunds/deletes
