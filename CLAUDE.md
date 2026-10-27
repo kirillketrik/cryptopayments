@@ -54,3 +54,16 @@ Each fake is tested in isolation (`tests/test_fake_*.py`); `tests/test_invoice_s
 ## Keeping this file current
 
 When a change alters the contract surface (adding/removing a contract or fake), changes the state machine's transition table, or changes an orchestration invariant in `PaymentService` (e.g. the sweep-delta behavior above), update the corresponding section of this file as part of that change rather than leaving it to drift.
+
+## Exact-amount shared-wallet workflow
+
+`exact.py` is a separate durable SQLite workflow, exported as ExactPaymentService.
+Reservations never expire or recycle: late payments must not pay another invoice.
+Use integer atomic units and Decimal conversion; scope identity by network, token
+contract and recipient. Serialize allocation and reconciliation transactions.
+`adapters.py` provides read-only Ethereum USDT, Tron USDT and native TON adapters;
+`__main__.py` supplies CLI commands. Never route shared wallets through the old
+PaymentService's address-wide aggregation. State changes for this workflow are
+pending/confirming/confirmed/expired/reorged, with downgrades for chain reorgs.
+The changes feed uses persistent sequence IDs for consumer idempotency.
+See docs/exact-amounts.md for finality, pagination and integration limitations.

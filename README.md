@@ -234,3 +234,11 @@ uv run pytest        # run tests with coverage (see pyproject.toml for config)
 Real network/RPC calls, real HD wallet derivation, real CREATE2/contract deployment,
 real database drivers, real webhook delivery, and any multi-network business rules
 beyond accepting a `network`/`currency` parameter.
+
+## Shared wallets with unique exact amounts
+
+Use `ExactPaymentService` for durable SQLite-backed shared-address invoices.
+Includes read adapters for USDT ERC20, USDT TRC20 and native TON, a reconciliation
+CLI, confirmation/reorg handling and a durable notification feed.
+See [setup, examples and matching rules](docs/exact-amounts.md).
+The original `PaymentService` remains the unique-address/fake workflow.

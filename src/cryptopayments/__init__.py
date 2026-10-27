@@ -42,3 +42,9 @@ __all__ = [
     "UnknownTransactionError",
     "UnsupportedNetworkError",
 ]
+
+from cryptopayments.exact import (
+    AmountSpaceExhausted, Asset, ExactInvoice, ExactPaymentService, Transfer,
+)
+
+__all__ += ['AmountSpaceExhausted', 'Asset', 'ExactInvoice', 'ExactPaymentService', 'Transfer']
