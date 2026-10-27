@@ -24,6 +24,14 @@ def main():
     sub.add_parser('expire')
     changes = sub.add_parser('changes')
     changes.add_argument('--after', type=int, default=0)
+    webhook = sub.add_parser('webhooks')
+    webhook.add_argument('--name', default='default')
+    webhook.add_argument('--url-env', default='WEBHOOK_URL')
+    webhook.add_argument('--secret-env', default='WEBHOOK_SECRET')
+    webhook.add_argument('--once', action='store_true')
+    webhook.add_argument('--list', action='store_true')
+    webhook.add_argument('--replay', type=int)
+    webhook.add_argument('--max-attempts', type=int, default=8)
     for network in ('ethereum', 'tron', 'ton'):
         scan = sub.add_parser('scan-' + network)
         scan.add_argument('--address', required=True)
@@ -33,6 +41,28 @@ def main():
             scan.add_argument('--rpc-env', default='ETHEREUM_RPC_URL')
     args = parser.parse_args()
     service = ExactPaymentService(args.database)
+    if args.command == 'webhooks':
+        import signal
+        import threading
+        from cryptopayments.webhooks import WebhookWorker
+        worker = WebhookWorker(service, name=args.name, url=os.environ[args.url_env],
+                               secret=os.environ[args.secret_env], max_attempts=args.max_attempts)
+        if args.list:
+            print(json.dumps(worker.deliveries()))
+            return
+        if args.replay is not None:
+            print(json.dumps({'replayed': worker.replay(args.replay)}))
+            return
+        stopped = threading.Event()
+        signal.signal(signal.SIGTERM, lambda *_: stopped.set())
+        signal.signal(signal.SIGINT, lambda *_: stopped.set())
+        while not stopped.is_set():
+            worked = worker.run_once()
+            if args.once:
+                return
+            if not worked:
+                stopped.wait(1)
+        return
     if args.command == 'create':
         from cryptopayments.adapters import ERC20_USDT, TRC20_USDT
         config = {'ethereum': ('ethereum:1', ERC20_USDT, 6, 12),

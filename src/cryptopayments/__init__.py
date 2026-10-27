@@ -48,3 +48,7 @@ from cryptopayments.exact import (
 )
 
 __all__ += ['AmountSpaceExhausted', 'Asset', 'ExactInvoice', 'ExactPaymentService', 'Transfer']
+
+from cryptopayments.webhooks import WebhookWorker, verify_signature
+
+__all__ += ['WebhookWorker', 'verify_signature']

@@ -99,7 +99,7 @@ Do not deliver goods solely because a client claims to have paid. A public exact
 amount identifies an invoice, not the sender's legal identity.
 
 No automatic refunds, signing, fund sweeps, fiat pricing, merchant HTTP API or
-webhook delivery is included. Funds already arrive at the shared wallet; a host
+hosted webhook receiver is included. Outgoing webhook delivery is described in the README. Funds already arrive at the shared wallet; a host
 integrates the library and consumes the notification feed. Read adapters have
 fixture-based tests; production endpoints, rate limits, credentials and actual
 mainnet transfers require integration validation before accepting real funds.

@@ -67,3 +67,14 @@ PaymentService's address-wide aggregation. State changes for this workflow are
 pending/confirming/confirmed/expired/reorged, with downgrades for chain reorgs.
 The changes feed uses persistent sequence IDs for consumer idempotency.
 See docs/exact-amounts.md for finality, pagination and integration limitations.
+
+## Webhook delivery and container runtime
+
+`webhooks.py` consumes the exact-payment journal into persistent per-subscription
+queues. Preserve stable event IDs/bodies, HMAC over timestamp.raw_body, retry
+classification and lease-token fencing. Network calls must remain outside SQLite
+transactions. Delivery is at least once and can be out of order. Redirects must
+not forward signed payloads. CLI `webhooks` supports continuous/one-shot operation,
+inspection and dead-letter replay; it does not scan chains. Docker runs as UID
+10001 with a writable /data volume and no network listener. README documents the
+actual API, queue semantics and integration limits.

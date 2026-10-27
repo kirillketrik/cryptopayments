@@ -1,244 +1,232 @@
 # cryptopayments
 
-A pluggable Python library for accepting cryptocurrency payments. A host application
-swaps storage, address generation, blockchain access, and fund-sweeping logic in and
-out by implementing a small set of contracts — business logic (`PaymentService`) never
-changes.
+Python 3.12+ library and CLI for accepting cryptocurrency payments on a shared
+wallet address. Each invoice reserves a unique exact amount; incoming transfers
+are matched by network, token contract, recipient, amount and payment window.
+Payment state, transfer history and webhook deliveries are stored in SQLite.
+No private keys are needed, and the library does not sign or broadcast transfers.
 
-**This is Phase 1.** It defines the full contract layer and ships fake, in-memory
-implementations of every contract, wired together through `PaymentService`. There is no
-real blockchain integration, database backend, or HD wallet/CREATE2 logic yet — the goal
-here is a working, fully testable skeleton that proves the abstractions hold together
-end to end. Later phases replace the fakes with real implementations behind the same
-interfaces.
+## Implemented functionality
 
-## Layout
+- Atomic allocation of unique amounts, including concurrent processes.
+- Exact integer atomic-unit matching; Decimal at the application boundary.
+- Invoice expiry, confirmation tracking and Ethereum reorg receipt refresh.
+- Read-only mainnet adapters for **USDT ERC20 (Ethereum)**, **USDT TRC20 (Tron)**
+  and **native TON**. TON jettons and other EVM chains are not included.
+- Persistent signed outgoing webhooks with retries, jitter, Retry-After,
+  worker leases, dead letters and manual replay.
+- CLI for creating/querying invoices, explicit-range scans and webhook workers.
+- Multi-stage Docker image and Compose configuration for the webhook worker.
 
-```
-src/cryptopayments/
-  exceptions.py        # PaymentLibraryError and subclasses
-  models/               # dataclasses / enums shared across contracts
-    invoice.py            # Invoice + InvoiceStatus state machine
-    address.py            # AddressAllocation, AddressStrategy
-    chain.py               # IncomingTransaction
-    sweep.py                # SweepResult
-    events.py                # PaymentEvent, PaymentEventType
-  contracts/            # abstract interfaces a host application implements
-    repository.py         # PaymentRepository
-    address_provider.py   # AddressProvider
-    chain_client.py        # ChainClient
-    sweep_strategy.py       # SweepStrategy
-    notifier.py               # Notifier
-  fakes/                # in-memory implementations of every contract, for tests/dev
-  service.py            # PaymentService, the orchestrator
-tests/                  # unit tests per fake + state machine + end-to-end pipeline tests
+This is a library and worker toolkit. It does not expose a merchant HTTP API or
+run a chain scheduler automatically. The host application supplies scan ranges,
+persists completed cursors and integrates invoice creation into its checkout.
+Mainnet adapters are tested with fixtures; validate your provider and real
+transfers before accepting production payments.
+
+## Install and test
+
+```sh
+uv sync --frozen --dev
+uv run --frozen pytest
+uv build
 ```
 
-## The contracts
+Runtime uses the Python standard library; there are no third-party runtime
+dependencies. Tests also use `openssl` for a local HTTPS delivery integration test.
 
-### `Invoice` and its status state machine (`models/invoice.py`)
-
-An `Invoice` tracks a request for payment: who it's for, what currency/network/amount,
-the address assigned to receive it, and its status. Status is only ever changed through
-`Invoice.transition_to()`, which enforces the legal state graph and raises
-`InvalidStatusTransitionError` on anything else:
-
-```
-PENDING ──────► PARTIALLY_PAID ──────► CONFIRMED ──────► OVERPAID
-   │                  │                                     ▲
-   │                  └─────────────────────────────────────┘
-   ├──────────────────────────────────────────────► CONFIRMED
-   └──────────────────────────────────────────────► EXPIRED
-   PARTIALLY_PAID ────────────────────────────────► EXPIRED
-```
-
-Two transitions beyond the literal spec are included deliberately, flagged here rather
-than silently added:
-
-- `PENDING → CONFIRMED` directly — a single transaction can fully pay *and* confirm an
-  invoice in one shot without ever being partially paid.
-- `PARTIALLY_PAID → OVERPAID` directly — a top-up transaction can push a partially paid
-  invoice straight past the requested amount without passing through `CONFIRMED`.
-
-`EXPIRED` and `OVERPAID` are terminal: nothing transitions out of them.
-
-### `PaymentRepository` (`contracts/repository.py`)
-
-Storage for invoices: `create`, `get`, `update`, `find_by_address` (used by
-`PaymentService` — well, in this phase invoices are looked up by id, but real chain
-listeners/webhook handlers will typically need to map an incoming-tx address back to an
-invoice), and `list` with optional `status`/`user_reference` filters.
-
-**Fake:** `InMemoryPaymentRepository` — a `dict[str, Invoice]`. It stores invoices *by
-reference*, so mutating an `Invoice` fetched via `get()` and then calling `update()` with
-it is safe and is exactly the pattern `PaymentService` uses. A real, out-of-process
-backend won't have that property — don't rely on it outside tests.
-
-**Swapping in a real implementation:** wrap your ORM/database — e.g. a Django model
-manager, a SQLAlchemy repository, or a thin wrapper around Redis/Mongo. `get`/`update`
-must raise `InvoiceNotFoundError`; `create` must raise `InvoiceAlreadyExistsError` on a
-duplicate id.
-
-### `AddressProvider` (`contracts/address_provider.py`)
-
-Allocates a receiving address for an invoice on a network. Real deployments pick between
-multiple *strategies* per network — modeled here as `AddressStrategy`:
-
-- `HD_DERIVED` — a fresh address per invoice, derived from an HD wallet.
-- `COUNTERFACTUAL_CREATE2` — a deterministic contract address that's only deployed once
-  funded.
-- `POOLED_WITH_MEMO` — one shared address per network, disambiguated by a per-invoice
-  memo/tag (common for chains like Tron/Stellar/XRP where per-invoice addresses are
-  impractical).
-
-**Fake:** `FakeAddressProvider` simulates all three without any real cryptography —
-`fake-addr-<network>-<hex>` / `fake-create2-<network>-<hex>` for the first two, and a
-shared `fake-pool-<network>-<hex>` address with a unique memo for the third. It accepts
-an optional `supported_networks` set purely to exercise `UnsupportedNetworkError`; Phase
-1 otherwise has no real per-network configuration.
-
-**Swapping in a real implementation:** wrap actual HD wallet derivation (BIP32/44) for
-`HD_DERIVED`, a CREATE2 factory contract call for `COUNTERFACTUAL_CREATE2`, or a
-configured pool address + memo/tag generator for `POOLED_WITH_MEMO`.
-
-### `ChainClient` (`contracts/chain_client.py`)
-
-Read-only access to chain state: `get_balance`, `list_incoming_transactions`,
-`get_confirmations`. Deliberately excludes anything that writes to a chain — that's
-`SweepStrategy`'s job.
-
-**Fake:** `FakeChainClient` is a hand-drivable chain simulator. Tests call
-`inject_transaction(...)` to place a transaction on the "chain" and `set_confirmations(...)`
-to advance it, so `PaymentService`'s polling/checking logic can be exercised
-deterministically without any network access.
-
-**Swapping in a real implementation:** wrap an RPC client / indexer API (e.g.
-`web3.py`, a block explorer API, `bitcoinrpc`, ...), typically with a background
-poller or webhook listener calling `PaymentService.check_payment` when new blocks land.
-
-### `SweepStrategy` (`contracts/sweep_strategy.py`)
-
-Moves confirmed funds from an invoice's deposit address to the host's main wallet.
-`PaymentService` calls it with the *incrementally new* amount seen since the last check
-(not the invoice's running total), so it's called again — with just the top-up amount —
-if an invoice goes from `CONFIRMED` to `OVERPAID` later.
-
-**Fake:** `FakeSweepStrategy` just records a `SweepResult` in-memory and logs the
-simulated action; no real transfer happens.
-
-**Swapping in a real implementation:** a direct on-chain transfer from the deposit
-address (if the host controls its key), a call to a gas-funded forwarder contract, or a
-batched/scheduled sweep job.
-
-### `Notifier` (`contracts/notifier.py`)
-
-Fired whenever an invoice's status changes. This is the one contract defined as a
-`typing.Protocol` rather than an `abc.ABC` — see below for why.
-
-**Fake:** `InMemoryNotifier` appends every `PaymentEvent` to a list so tests can assert
-on it. It deliberately does *not* subclass `Notifier`, to demonstrate that it doesn't
-need to.
-
-**Swapping in a real implementation:** deliver a webhook, publish to a queue (Celery
-task, SQS, ...), or push over a Django Channels group — see "Sync now, async later" below.
-
-### `PaymentService` (`service.py`)
-
-The orchestrator. Constructed with all five contracts injected (no hardcoded fakes):
+## Create an invoice
 
 ```python
-service = PaymentService(
-    repository=InMemoryPaymentRepository(),
-    address_provider=FakeAddressProvider(),
-    chain_client=FakeChainClient(),
-    sweep_strategy=FakeSweepStrategy(),
-    notifier=InMemoryNotifier(),  # optional — omit to run without notifications
-)
+from decimal import Decimal
+from cryptopayments import Asset, ExactPaymentService
+from cryptopayments.adapters import ERC20_USDT
 
+service = ExactPaymentService('payments.sqlite')
+asset = Asset('ethereum:1', ERC20_USDT,
+              '0x1111111111111111111111111111111111111111', 6)
 invoice = service.create_invoice(
-    user_reference="user-123",
-    currency="BTC",
-    network="bitcoin",
-    requested_amount=Decimal("0.5"),
+    user_reference='order-123', asset=asset, amount=Decimal('10'),
+    suffix_slots=1000, confirmations_required=12,
 )
-
-# ... later, e.g. from a poller or a webhook handler ...
-invoice = service.check_payment(invoice.id)
+print(invoice.id, invoice.asset.address, str(invoice.payment_amount))
 ```
 
-`check_payment` re-derives status from the chain client's current view every time it's
-called (not from a delta since the last call), so it's safe to call repeatedly/idempotently
-— it's a no-op unless something on-chain actually changed. On a status change it: updates
-the invoice via the repository, sweeps via `SweepStrategy` the moment the invoice reaches
-`CONFIRMED`/`OVERPAID`, and fires `Notifier`.
+Payable amount is the base price plus **1..suffix_slots atomic units**. For USDT
+with 6 decimals and 1,000 slots, a 10 USDT invoice requests between 10.000001 and
+10.001000 USDT. Display `payment_amount` verbatim and disclose the final price.
+The customer must send it in one transfer without subtracting fees. Underpayment,
+overpayment or split payments are retained for manual reconciliation, never
+summed or guessed. Assets are identified by network and contract, not ticker.
 
-## Design notes
+Reservations are **never reused**, including after expiry or payment. Otherwise a
+late transfer could pay someone else's order. Capacity is finite; exhaustion
+raises `AmountSpaceExhausted`. Expand the acceptable amount range, use another
+base price or add wallets. All writers for a wallet must share the same database.
+Back it up; use local persistent storage rather than network-mounted SQLite.
 
-### `abc.ABC` vs `typing.Protocol`
+Default invoice TTL is 30 minutes. An on-time payment observed after expiry may
+still confirm the original invoice. A payment outside the invoice window cannot.
+States: `pending`, `confirming`, `confirmed`, `expired`, `reorged`. Confirmations
+can be downgraded after a reorg. A confirmed invoice is not irrevocable settlement.
 
-The rule applied consistently: **multi-method, stateful "service" contracts are `ABC`s;
-single-method, callback-shaped contracts are `Protocol`s.**
+## Scan blockchains
 
-`PaymentRepository`, `AddressProvider`, `ChainClient`, and `SweepStrategy` are all `ABC`s.
-They each expose more than one related method, a host implementation genuinely "is a"
-repository/provider/client, and `abc`'s enforcement (you can't instantiate an incomplete
-implementation) is a feature, not friction, for something a codebase will implement once
-and reuse everywhere.
-
-`Notifier` is a `Protocol`. It has exactly one method and no shared lifecycle or state to
-enforce. Structural typing means a host application's existing webhook dispatcher, a
-Celery task wrapper, or even a plain function adapted with a one-line class already
-satisfies it — no need to import and subclass a library base class just to hand over a
-callback. `@runtime_checkable` is added so `isinstance()` checks against it work, which
-is convenient in tests (see `test_fake_notifier.py`).
-
-If this library grows, other single-method contracts (e.g. a currency-rate lookup) should
-follow `Notifier`'s lead; anything that accumulates more than one closely-related method
-should follow the others.
-
-### Sync now, async later
-
-All contracts are synchronous. The host stack (Django Channels/Celery) is
-async-friendly elsewhere, so I/O-bound methods (`ChainClient`, `Notifier`) are kept to
-single, narrow calls with no internal state — easy to wrap with `asyncio.to_thread` or
-run inside a Celery task without an interface change. I didn't add `async def` variants
-now because Phase 1 has nothing that actually awaits anything (the fakes are pure
-in-memory), and speculative async would just be surface area to get wrong before a real
-I/O-bound implementation exists to validate it against.
-
-### Amounts are always `Decimal`
-
-Every monetary field (`Invoice.requested_amount`, `amount_received`,
-`IncomingTransaction.amount`, `SweepResult.amount`) is `Decimal`. `float` never appears in
-a monetary context anywhere in this library — floating-point error is not an acceptable
-risk for payment amounts.
-
-### A contract boundary worth flagging
-
-`PaymentRepository.find_by_address` isn't used by `PaymentService` in Phase 1 —
-`check_payment` takes an invoice id, not an address. It's included because it's the
-obvious method a real chain listener or inbound-webhook handler will need immediately
-("a transaction just landed on address X, which invoice is that?"), and it's a repository
-concern, not an orchestrator one. If Phase 2 doesn't end up needing it in that shape,
-it should move rather than linger.
-
-## Development
-
-```bash
-uv sync --dev       # install
-uv run pytest        # run tests with coverage (see pyproject.toml for config)
+```sh
+uv run python -m cryptopayments --database payments.sqlite create \
+  --network ethereum --address 0x1111111111111111111111111111111111111111 \
+  --amount 10 --reference order-123
+uv run python -m cryptopayments --database payments.sqlite get INVOICE_ID
+uv run python -m cryptopayments --database payments.sqlite expire
+uv run python -m cryptopayments --database payments.sqlite changes --after 0
 ```
 
-## Explicitly out of scope for Phase 1
+Configure keys through the process environment; do not put credentials in CLI
+arguments or commit them. Adapters use HTTPS with certificate verification.
 
-Real network/RPC calls, real HD wallet derivation, real CREATE2/contract deployment,
-real database drivers, real webhook delivery, and any multi-network business rules
-beyond accepting a `network`/`currency` parameter.
+| CLI command | Range units | Configuration | Finality |
+| --- | --- | --- | --- |
+| `scan-ethereum --address 0x… --start N --end N` | Inclusive block heights | `ETHEREUM_RPC_URL` (HTTPS Ethereum mainnet RPC) | Configurable depth, default 12 |
+| `scan-tron --address T… --start N` | Unix milliseconds | Optional `TRONGRID_API_KEY` | TronGrid solidified transfers |
+| `scan-ton --address 0:… --start N --end N` | Unix seconds | Optional `TONCENTER_API_KEY` | Toncenter masterchain-referenced transactions |
 
-## Shared wallets with unique exact amounts
+CLI-created Tron/TON invoices use `confirmations_required=1` to represent the
+adapter's finalized observation, not one arbitrary blockchain confirmation.
+TON uses a raw `workchain:64_hex_digits` wallet address. Tron uses Base58 addresses;
+Ethereum recipients are normalized to lower case.
 
-Use `ExactPaymentService` for durable SQLite-backed shared-address invoices.
-Includes read adapters for USDT ERC20, USDT TRC20 and native TON, a reconciliation
-CLI, confirmation/reorg handling and a durable notification feed.
-See [setup, examples and matching rules](docs/exact-amounts.md).
-The original `PaymentService` remains the unique-address/fake workflow.
+Start scans at or before the oldest invoice. Retry failed scans without advancing
+the cursor, follow pagination, and overlap ranges for indexer lag. Persist a scan
+cursor only after the command succeeds. TON pagination needs a fixed closed time
+window. Ethereum scans also refresh previously recorded receipts to detect
+removed events. Your scheduler must keep scanning and call `expire` regularly.
+Required egress: your RPC host, `api.trongrid.io`, and `toncenter.com`.
+See [matching and scanning details](docs/exact-amounts.md).
+
+## Outgoing webhooks
+
+Webhook workers consume the exact-payment status journal, including events
+recorded before the subscription was created. Each subscription has a stable
+name and fixed URL. The queue and its cursor are committed atomically; HTTP calls
+happen outside database transactions. Multiple workers coordinate through leases.
+
+Set `WEBHOOK_URL` to an operator-controlled HTTPS endpoint and `WEBHOOK_SECRET`
+to a securely generated secret of at least 32 bytes. The secret is supplied at
+runtime and is not stored in SQLite. Start a worker:
+
+```sh
+uv run python -m cryptopayments --database payments.sqlite webhooks --name orders
+# Process at most one delivery (also enqueues the next batch of journal events):
+uv run python -m cryptopayments --database payments.sqlite webhooks --name orders --once
+# Inspect delivery states or retry a dead letter:
+uv run python -m cryptopayments --database payments.sqlite webhooks --name orders --list
+uv run python -m cryptopayments --database payments.sqlite webhooks --name orders --replay 42
+```
+
+SIGTERM/SIGINT stop the worker after the current HTTP attempt. Restarting resumes
+persistent work. The default limit is 8 attempts, configurable with
+`--max-attempts`. Retryable failures are network/timeouts, HTTP 408/425/429 and 5xx.
+Other responses, including redirects, become dead letters. Only 2xx acknowledges
+delivery. Requests time out after 10 seconds. Exponential retry windows start at
+5 seconds, use jitter and cap at 1 hour. Retry-After seconds and HTTP dates are
+honored up to the same cap. Library constructor parameters customize these values.
+A crashed attempt counts toward the retry limit; its lease expires automatically.
+No redirect following: signatures and bodies stay on the configured endpoint.
+
+Payload:
+
+```json
+{
+  "event_id": "42",
+  "type": "invoice.status_changed",
+  "created_at": 1793090000,
+  "invoice": {
+    "id": "invoice-id",
+    "user_reference": "order-123",
+    "asset": {
+      "network": "ethereum:1",
+      "asset_id": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+      "address": "0x1111111111111111111111111111111111111111",
+      "decimals": 6
+    },
+    "payment_amount": "10.000123",
+    "status": "confirmed"
+  }
+}
+```
+
+Headers: `X-Cryptopayments-Event-Id`, `X-Cryptopayments-Timestamp`, and
+`X-Cryptopayments-Signature`. Signature is hex HMAC-SHA256 over
+`timestamp + "." + raw_body`. Verify before parsing or acting:
+
+```python
+from cryptopayments import verify_signature
+
+valid = verify_signature(
+    secret, timestamp_header, raw_request_body, signature_header,
+)  # default timestamp tolerance: 300 seconds
+```
+
+Retries retain the event ID and exact body; timestamp/signature are refreshed.
+Delivery is **at least once**, not exactly once: a receiver may succeed before a
+sender crashes. Deduplicate by event ID within this database/source, transactionally
+with the business action. Events can arrive out of order because retries do not
+block newer events. Use sequence IDs to avoid applying an older status over a
+newer one, and handle `reorged`/confirmation downgrades. Keep clocks synchronized.
+A new subscription name replays the journal; changing its URL under the existing
+name fails. For secret rotation, coordinate the receiver and all workers; payloads
+are signed with the currently supplied secret. Monitor `dead` deliveries and replay
+only after resolving the endpoint problem. No inbound webhook receiver is exposed.
+
+## Docker
+
+```sh
+docker build -t cryptopayments .
+docker volume create payments-data
+docker run --rm --mount source=payments-data,target=/data cryptopayments \
+  --database /data/payments.sqlite create --network ethereum \
+  --address 0x1111111111111111111111111111111111111111 --amount 10 --reference order-123
+# With WEBHOOK_URL and WEBHOOK_SECRET already exported in the host environment:
+docker run --rm --read-only --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --mount source=payments-data,target=/data \
+  -e WEBHOOK_URL -e WEBHOOK_SECRET cryptopayments \
+  --database /data/payments.sqlite webhooks --name orders
+```
+
+Alternatively, `docker compose up -d --build` starts the webhook worker using the
+required environment variables and a Compose-managed `payments` volume. Create
+invoices in that same database with:
+
+```sh
+docker compose run --rm webhooks --database /data/payments.sqlite create \
+  --network ethereum --address 0x1111111111111111111111111111111111111111 \
+  --amount 10 --reference order-123
+```
+
+The image runs as UID/GID 10001 and installs the frozen runtime environment without
+dev dependencies. Use a writable persistent `/data` volume; bind mounts must be
+owned by UID 10001. Everything else can be read-only. There is no web server or
+port to expose. Scanners must run separately against the same volume; the Compose
+worker only delivers existing events and does not watch a blockchain or expire
+invoices. Image builds do not include Foundry or Solidity sources.
+
+## Original unique-address workflow and Solidity contracts
+
+The original `PaymentService` remains available with pluggable repository,
+address provider, chain client, sweep strategy and notifier interfaces. Its
+bundled implementations are in-memory fakes, suitable for tests. **Do not use its
+address-wide aggregation on a shared wallet**; use `ExactPaymentService` instead.
+
+`contracts/` contains an independent EVM CREATE2 forwarder/factory implementation,
+with Foundry tests and a deployment script. It is optional for shared-address
+payments and has no Python RPC bridge. See [contracts README](contracts/README.md).
+
+## Scope and validation
+
+No automatic refunds, fund sweeps, fiat conversion, exchange integration, merchant
+HTTP API, hosted receiver, or built-in chain polling scheduler is included.
+Outgoing webhook delivery has automated retry, concurrency, restart and local
+HTTPS tests. These checks do not validate live mainnet integrations or merchant
+endpoints. SQLite reservations, events and delivery history must be backed up
+together; history is not automatically pruned.

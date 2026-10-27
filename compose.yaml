@@ -1,0 +1,17 @@
+services:
+  webhooks:
+    build: .
+    command: ["--database", "/data/payments.sqlite", "webhooks"]
+    environment:
+      WEBHOOK_URL: ${WEBHOOK_URL:?Set WEBHOOK_URL to your HTTPS receiver}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?Set a random signing secret of at least 32 bytes}
+    volumes:
+      - payments:/data
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 30s
+volumes:
+  payments:
